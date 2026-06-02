@@ -5,6 +5,7 @@
 __pycache__/
 *.pyc
 venv/
+.venv/
 env/
 
 # 임시 오디오 파일
