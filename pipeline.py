@@ -212,7 +212,7 @@ class SimSpeakAIPipeline:
         async with aiofiles.open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: 
             return await f.read()
 
-    async def run(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage: str = "stage_1") -> dict:
+    async def run(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: str = "stage_1") -> dict:
         char_id = character_id.lower()
         if user_id not in session_db: session_db[user_id] = {}
         if char_id not in session_db[user_id]:
@@ -305,7 +305,7 @@ class SimSpeakAIPipeline:
                 ))
                 korean_ratio = korean_word_count / len(words)
 
-            stage_clean = str(stage).lower().strip().replace(" ", "_")
+            stage_clean = str(stage_id).lower().strip().replace(" ", "_")
             threshold = 0.30  # 기본값
             if stage_clean in ["stage_1", "stage_2"]:
                 threshold = 0.30
@@ -315,7 +315,7 @@ class SimSpeakAIPipeline:
                 threshold = 0.10
 
             if korean_ratio >= threshold:
-                print(f"[Stage Penalty] Triggered! Korean ratio: {korean_ratio:.2f} >= threshold: {threshold:.2f} in stage: {stage}")
+                print(f"[Stage Penalty] Triggered! Korean ratio: {korean_ratio:.2f} >= threshold: {threshold:.2f} in stage_id: {stage_id}")
                 ai_result["affinity_delta"] = -1
                 if "system_evaluation" not in ai_result:
                     ai_result["system_evaluation"] = {}

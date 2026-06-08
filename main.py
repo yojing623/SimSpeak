@@ -61,7 +61,7 @@ class ChatLogModel(Base):
     ai_audio_url = Column(Text, nullable=True)           # AI 답변 음성 주소 기록용
     current_affinity = Column(Integer, default=30)       # 영구 저장되는 호감도 스탯
     summary_context = Column(Text, nullable=True)        # [토큰 절약] 오래된 과거 기억 압축 저장소
-    stage = Column(String(50), nullable=True)            # 진행 중인 스테이지 정보 기록
+    stage_id = Column(String(50), nullable=True)            # 진행 중인 스테이지 정보 기록
     
     # 데이터베이스 종류에 맞춰 유연하게 컬럼 타입 세팅 (PostgreSQL일 때는 전용 고성능 JSONB 강제)
     if DATABASE_URL.startswith("sqlite"):
@@ -92,15 +92,15 @@ try:
     Base.metadata.create_all(bind=engine)
     print(f"[DB Success] Verified / created table successfully on {DATABASE_URL.split('://')[0]} database!")
     
-    # [DB 자동 마이그레이션] 기존 Neon DB/SQLite 테이블에 stage 컬럼이 없을 경우 자동으로 추가
+    # [DB 자동 마이그레이션] 기존 Neon DB/SQLite 테이블에 stage_id 컬럼이 없을 경우 자동으로 추가
     from sqlalchemy import text
     try:
         with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE chat_logs ADD COLUMN stage VARCHAR(50);"))
-        print("[DB Success] Automatically added 'stage' column to chat_logs table.")
+            conn.execute(text("ALTER TABLE chat_logs ADD COLUMN stage_id VARCHAR(50);"))
+        print("[DB Success] Automatically added 'stage_id' column to chat_logs table.")
     except Exception as alter_err:
         # 이미 컬럼이 존재하는 등의 이유로 에러가 나면 무시하고 정상 진행합니다.
-        print(f"[DB Info] Auto ALTER COLUMN 'stage' status: {alter_err}")
+        print(f"[DB Info] Auto ALTER COLUMN 'stage_id' status: {alter_err}")
 except Exception as table_err:
     print(f"[DB Error] Table creation/verification failed: {table_err}")
 
@@ -121,7 +121,7 @@ class ChatRequest(BaseModel):
     text: str
     is_video_call: bool
     user_audio_url: Optional[str] = None  # 다른 팀원이 Blob에 저장 후 넘겨줄 오디오 URL 주소
-    stage: Optional[str] = "stage_1"
+    stage_id: Optional[str] = "stage_1"
 
 # AI 파이프라인 인스턴스 전역 생성
 pipeline = SimSpeakAIPipeline()
@@ -171,7 +171,7 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
             user_text=request.text,
             is_video_call=request.is_video_call,
             user_audio_url=request.user_audio_url,
-            stage=request.stage
+            stage_id=request.stage_id
         )
 
         # 파이프라인 실행 후 업데이트된 세션 정보 및 친밀도 회수
@@ -195,7 +195,7 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
             chat_history_context=updated_history,                            # JSON/JSONB 타입으로 대화 배열 통째로 적재
             raw_llm_log=raw_usage_log,                                       # JSON/JSONB 타입으로 토큰 사용량 생로그 저장
             summary_context=updated_summary,                                 # 압축 누적된 장기 기억 요약본 저장
-            stage=request.stage
+            stage_id=request.stage_id
         )
         db.add(new_log)
 
