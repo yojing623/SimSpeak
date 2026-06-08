@@ -6,10 +6,11 @@ from typing import Optional
 from dotenv import load_dotenv
 
 # [DB 설정] SQLAlchemy 라이브러리 추가
-from sqlalchemy import create_engine, Column, Integer, String, Text
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+import datetime
 
 # 패키징된 AI 파이프라인 클래스 로드
 from pipeline import SimSpeakAIPipeline
@@ -71,10 +72,35 @@ class ChatLogModel(Base):
         chat_history_context = Column(JSONB, nullable=False)   # 대화 히스토리 배열 통째로 저장 (JSONB)
         raw_llm_log = Column(JSONB, nullable=False)            # 대표님 보고용 토큰 및 원본 생로그 (JSONB)
 
+# [팀원 DB 구조 통합] character_chat_logs 테이블 구조 정의
+class CharacterChatLogModel(Base):
+    __tablename__ = "character_chat_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(100), nullable=False)
+    character_id = Column(String(50), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+    if DATABASE_URL.startswith("sqlite"):
+        from sqlalchemy import JSON
+        response_data = Column(JSON, nullable=False)
+    else:
+        response_data = Column(JSONB, nullable=False)
+
 # 백엔드가 켜질 때 테이블이 없으면 자동으로 DB에 만들어 주는 안전장치
 try:
     Base.metadata.create_all(bind=engine)
     print(f"[DB Success] Verified / created table successfully on {DATABASE_URL.split('://')[0]} database!")
+    
+    # [DB 자동 마이그레이션] 기존 Neon DB/SQLite 테이블에 stage 컬럼이 없을 경우 자동으로 추가
+    from sqlalchemy import text
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE chat_logs ADD COLUMN stage VARCHAR(50);"))
+        print("[DB Success] Automatically added 'stage' column to chat_logs table.")
+    except Exception as alter_err:
+        # 이미 컬럼이 존재하는 등의 이유로 에러가 나면 무시하고 정상 진행합니다.
+        print(f"[DB Info] Auto ALTER COLUMN 'stage' status: {alter_err}")
 except Exception as table_err:
     print(f"[DB Error] Table creation/verification failed: {table_err}")
 
@@ -138,7 +164,7 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
 
     try:
         # 단일 파이프라인 가동 (STT -> LLM -> TTS -> Blob 업로드 일괄 수행)
-        ai_result = pipeline.run(
+        ai_result = await pipeline.run(
             session_db=temp_session_db,
             user_id=user_id,
             character_id=char_id,
@@ -172,8 +198,17 @@ async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db
             stage=request.stage
         )
         db.add(new_log)
+
+        # [팀원 DB 구조 통합] character_chat_logs 테이블에도 동일하게 response JSON 저장
+        new_monitoring_log = CharacterChatLogModel(
+            user_id=user_id,
+            character_id=char_id,
+            response_data=ai_result
+        )
+        db.add(new_monitoring_log)
+
         db.commit() # 데이터베이스 저장 확정!
-        print("[DB Success] Dialog and raw monitoring logs saved successfully.")
+        print("[DB Success] Dialog and raw monitoring logs saved successfully (both chat_logs and character_chat_logs).")
         
         return ai_result
 
