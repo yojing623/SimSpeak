@@ -24,6 +24,24 @@ class SimSpeakAIPipeline:
         self.speech_region = os.getenv("AZURE_SPEECH_REGION", "eastus")
         self.storage_connection = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 
+        # 🚀 [최적화 핵심] 커넥션 풀링 (Connection Pooling)
+        self.http_client = httpx.AsyncClient(timeout=15.0)
+        
+        self.llm_client = AsyncAzureOpenAI(
+            azure_endpoint=self.openai_endpoint,
+            api_key=self.openai_key,
+            api_version="2024-02-15-preview"
+        )
+        
+        self.whisper_api_client = AsyncAzureOpenAI(
+            azure_endpoint=self.whisper_endpoint,
+            api_key=self.whisper_key,
+            api_version="2024-02-15-preview"
+        )
+        
+        self.blob_service = BlobServiceClient.from_connection_string(self.storage_connection)
+        self.blob_container = self.blob_service.get_container_client("audio-files")
+
     async def call_llm_with_retry(self, ai_client, **kwargs):
         max_retries = 2
         backoff = 1.0
@@ -37,25 +55,17 @@ class SimSpeakAIPipeline:
                     raise e
 
     async def generate_lightning_dialogue(self, messages: list) -> str:
-        async_client = AsyncAzureOpenAI(
-            azure_endpoint=self.openai_endpoint,
-            api_key=self.openai_key,
-            api_version="2024-02-15-preview"
-        )
         safe_messages = []
         for m in messages:
             if m["role"] == "system":
                 safe_messages.append(m)
             else:
-                safe_messages.append({
-                    "role": m["role"], 
-                    "content": [{"type": "text", "text": str(m["content"])}]
-                })
+                safe_messages.append({"role": m["role"], "content": [{"type": "text", "text": str(m["content"])}]})
 
         try:
             response = await self.call_llm_with_retry(
-                async_client,
-                model="gpt-4o-mini", # ⚡ [복구 완료] 대사 초고속 출력을 위해 mini 모델 하드코딩 유지
+                self.llm_client,
+                model="gpt-4o-mini",
                 messages=safe_messages,
                 max_tokens=250
             )
@@ -83,16 +93,14 @@ class SimSpeakAIPipeline:
     async def quick_whisper_transcription(self, user_id: str, audio_url: str) -> str:
         if not audio_url: return ""
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(audio_url, timeout=15.0)
-                if response.status_code != 200: return ""
-                audio_bytes = response.content
+            response = await self.http_client.get(audio_url)
+            if response.status_code != 200: return ""
+            audio_bytes = response.content
 
-            whisper_client = AsyncAzureOpenAI(azure_endpoint=self.whisper_endpoint, api_key=self.whisper_key, api_version="2024-02-15-preview")
             audio_file = io.BytesIO(audio_bytes)
             audio_file.name = "speech.wav"
             
-            whisper_result = await whisper_client.audio.transcriptions.create(
+            whisper_result = await self.whisper_api_client.audio.transcriptions.create(
                 file=audio_file, model=self.whisper_deployment, prompt="Hello! 안녕하세요.", language="en"
             )
             print(f" 🔍 [ASYNC FLOW] User '{user_id}' - Whisper Text Extracted: '{whisper_result.text}'")
@@ -107,16 +115,14 @@ class SimSpeakAIPipeline:
             return error_response
             
         temp_audio_file = f"temp_eval_{uuid.uuid4().hex[:8]}.wav"
-        
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(audio_url, timeout=15.0)
-                if response.status_code != 200: 
-                    print(f" ❌ [SPEECH ACC] 오디오 다운로드 에러. HTTP {response.status_code}")
-                    return error_response
+            response = await self.http_client.get(audio_url)
+            if response.status_code != 200: 
+                print(f" ❌ [SPEECH ACC] 오디오 다운로드 에러. HTTP {response.status_code}")
+                return error_response
                 
-                with open(temp_audio_file, "wb") as f:
-                    f.write(response.content)
+            with open(temp_audio_file, "wb") as f:
+                f.write(response.content)
 
             def run_speech_assessment():
                 speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
@@ -125,8 +131,7 @@ class SimSpeakAIPipeline:
                 pure_english_reference = re.sub(r'[^a-zA-Z\s\']', ' ', reference_text)
                 pure_english_reference = " ".join(pure_english_reference.split())
                 
-                if not pure_english_reference:
-                    return None
+                if not pure_english_reference: return None
 
                 pronunciation_config = speechsdk.PronunciationAssessmentConfig(
                     reference_text=pure_english_reference,
@@ -148,19 +153,8 @@ class SimSpeakAIPipeline:
                 for word in assessment_result.words:
                     ipa_guide = f"[{''.join(p.phoneme for p in word.phonemes)}]" if word.phonemes else ""
                     guide = ipa_guide if word.accuracy_score < 75 else ""
-                    word_details_list.append({
-                        "word": word.word.strip(), 
-                        "accuracy": int(word.accuracy_score), 
-                        "error_type": word.error_type if word.error_type != "None" else None, 
-                        "guide": guide
-                    })
-                return {
-                    "accuracy": int(assessment_result.accuracy_score), 
-                    "fluency": int(assessment_result.fluency_score), 
-                    "completeness": int(assessment_result.completeness_score), 
-                    "prosody": int(assessment_result.prosody_score), 
-                    "word_details_json": word_details_list
-                }
+                    word_details_list.append({"word": word.word.strip(), "accuracy": int(word.accuracy_score), "error_type": word.error_type if word.error_type != "None" else None, "guide": guide})
+                return {"accuracy": int(assessment_result.accuracy_score), "fluency": int(assessment_result.fluency_score), "completeness": int(assessment_result.completeness_score), "prosody": int(assessment_result.prosody_score), "word_details_json": word_details_list}
             else:
                 return error_response
         except Exception as e:
@@ -184,9 +178,9 @@ class SimSpeakAIPipeline:
             await asyncio.to_thread(run_tts_synthesis)
 
             def upload_to_blob():
-                blob_service_client = BlobServiceClient.from_connection_string(self.storage_connection)
-                blob_client = blob_service_client.get_blob_client(container="audio-files", blob=temp_filename)
-                with open(temp_filename, "rb") as data: blob_client.upload_blob(data, overwrite=True)
+                blob_client = self.blob_container.get_blob_client(temp_filename)
+                with open(temp_filename, "rb") as data: 
+                    blob_client.upload_blob(data, overwrite=True)
                 return blob_client.url
             blob_url = await asyncio.to_thread(upload_to_blob)
             return blob_url
@@ -200,9 +194,6 @@ class SimSpeakAIPipeline:
     async def get_character_prompt(self, character_id: str) -> str:
         async with aiofiles.open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: return await f.read()
 
-    # =========================================================================
-    # ⚡ 1차 초고속 대사 처리용 최적화 런타임
-    # =========================================================================
     async def run_only_dialogue_track(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: str = "stage_1") -> dict:
         char_id = character_id.lower()
         if user_id not in session_db: session_db[user_id] = {}
@@ -245,10 +236,7 @@ class SimSpeakAIPipeline:
         except Exception:
             text_match = re.search(r'"text_content"\s*:\s*"([^"]+)"', clean_json_str)
             action_match = re.search(r'"action_description"\s*:\s*"([^"]+)"', clean_json_str)
-            ai_result = {
-                "text_content": text_match.group(1) if text_match else "Oh, sorry! I got distracted. What were you saying?",
-                "action_description": action_match.group(1) if action_match else "여유롭게 웃어 보인다."
-            }
+            ai_result = {"text_content": text_match.group(1) if text_match else "Oh, sorry! I got distracted. What were you saying?", "action_description": action_match.group(1) if action_match else "여유롭게 웃어 보인다."}
 
         ai_result["affinity_delta"] = 1
         ai_result["system_evaluation"] = {"is_penalty": False}
@@ -275,18 +263,15 @@ class SimSpeakAIPipeline:
         return ai_result
 
     # =========================================================================
-    # ⚡ 2차 오답노트 백그라운드 (동적 IPA 가이드라인 탑재)
+    # ⚡ 2차 오답노트 백그라운드 (차단벽 제거 및 텍스트 검사 무조건 실행 완벽 적용)
     # =========================================================================
     async def run_only_evaluation_track(self, user_id: str, character_id: str, user_text: str, stage_id: str = "stage_1", user_audio_url: str = None) -> dict:
         char_id = character_id.lower()
-        ai_client = AsyncAzureOpenAI(azure_endpoint=self.openai_endpoint, api_key=self.openai_key, api_version="2024-02-15-preview")
         
-        if not user_audio_url or user_audio_url.strip() == "":
-            return {"system_evaluation": {"is_penalty": False, "grammar_feedback": "음성 파일 링크가 존재하지 않아 평가가 스킵되었습니다.", "corrections_json": [], "pronunciation_evaluations": None, "pronunciation_feedback": None}}
+        # 🟢 [수정됨] 텍스트가 아예 없으면 평가할 게 없으므로 종료하지만, 오디오가 없다고 튕겨내지 않습니다!
+        if not user_text or user_text.strip() == "":
+             return {"system_evaluation": {"is_penalty": False, "grammar_feedback": "입력된 텍스트가 없어 평가가 스킵되었습니다.", "corrections_json": [], "pronunciation_evaluations": None, "pronunciation_feedback": None}}
 
-        real_pronunciation_evaluations = await self.run_azure_pronunciation_assessment(user_id, user_audio_url, user_text)
-
-        # 🟢 [수정됨] 프롬프트 내부에 "ipa_guides" 생성을 지시하여, AI가 유저 단어의 발음 기호 사전을 실시간으로 뱉어내게 만듭니다.
         system_feedback_prompt = """
         너는 영어 교육 평가 시스템이야. 유저가 콩글리시나 어색한 한글 섞인 표현을 썼다면 세련된 100% 원어민 영문으로 고쳐줘.
         또한, 유저 원문(original_sentence)에 포함된 주요 영단어들에 대한 정확한 원어민 IPA 발음 기호(예: [kæˈfeɪ])를 'ipa_guides' 딕셔너리에 포함해줘.
@@ -304,10 +289,12 @@ class SimSpeakAIPipeline:
             }
         }
         """
+        
+        # 1. 문법 및 IPA 교정 (무조건 실행)
         try:
             response = await self.call_llm_with_retry(
-                ai_client, 
-                model="gpt-4o-mini", # ⚡ [복구 완료] 초고속 피드백 연산을 위해 mini 모델 적용 유지
+                self.llm_client, 
+                model="gpt-4o-mini", 
                 messages=[{"role": "system", "content": system_feedback_prompt}, {"role": "user", "content": [{"type": "text", "text": str(user_text)}]}],
             )
             clean_feedback = re.sub(r'```json\s*|```', '', response.choices[0].message.content).strip()
@@ -319,10 +306,7 @@ class SimSpeakAIPipeline:
             feedback_json["corrections_json"] = feedback_json.pop("corrections")
         
         if "corrections_json" not in feedback_json or not feedback_json["corrections_json"]:
-            feedback_json["corrections_json"] = [{
-                "original_sentence": user_text,
-                "corrected_sentence": user_text
-            }]
+            feedback_json["corrections_json"] = [{"original_sentence": user_text, "corrected_sentence": user_text}]
             if "grammar_feedback" not in feedback_json or not feedback_json["grammar_feedback"]:
                 feedback_json["grammar_feedback"] = "추가적인 콩글리시 패턴이나 문법적 오류가 감지되지 않은 완성도 높은 문장입니다."
 
@@ -333,10 +317,14 @@ class SimSpeakAIPipeline:
             else:
                 corr["corrected_audio_url"] = None
 
-        # 🟢 [수정됨] 하드코딩되었던 fallback_ipa_map 완전 삭제
-        # GPT가 실시간으로 분석해준 ipa_guides 딕셔너리를 소문자 키값으로 가져옵니다.
         gpt_ipa_map = {k.lower(): v for k, v in feedback_json.get("ipa_guides", {}).items()}
 
+        # 2. 발음 평가 (오디오가 전달되었을 때만 선택적 실행)
+        real_pronunciation_evaluations = None
+        if user_audio_url and user_audio_url.strip() != "":
+            real_pronunciation_evaluations = await self.run_azure_pronunciation_assessment(user_id, user_audio_url, user_text)
+
+        # 3. 데이터 조립
         if real_pronunciation_evaluations and len(real_pronunciation_evaluations.get("word_details_json", [])) > 0:
             for word_obj in real_pronunciation_evaluations.get("word_details_json", []):
                 acc = word_obj.get("accuracy", 0)
@@ -346,15 +334,17 @@ class SimSpeakAIPipeline:
                     word_obj["guide"] = ""
                 else:
                     g_val = word_obj.get("guide", "")
-                    # 🟢 [수정됨] Azure가 발음 기호를 안 줬을 때, GPT가 동적으로 생성한 사전에서 가져옵니다.
-                    if not g_val and w_lower in gpt_ipa_map: 
-                        g_val = gpt_ipa_map[w_lower]
+                    if not g_val and w_lower in gpt_ipa_map: g_val = gpt_ipa_map[w_lower]
                     word_obj["guide"] = g_val if (g_val.startswith("[") or not g_val) else f"[{g_val}]"
             
             feedback_json["pronunciation_evaluations"] = real_pronunciation_evaluations
             feedback_json["pronunciation_feedback"] = "전반적인 문장 억양과 발음 분석이 성공적으로 마감되었습니다."
         else:
             feedback_json["pronunciation_evaluations"] = None
-            feedback_json["pronunciation_feedback"] = "오디오 입력 상태 미비 또는 매칭 텍스트 부재로 인해 정밀 발음 평가를 수립할 수 없습니다."
+            # 🟢 [수정됨] 텍스트 모드와 오디오 실패 모드의 피드백 메시지를 분리했습니다.
+            if not user_audio_url or user_audio_url.strip() == "":
+                feedback_json["pronunciation_feedback"] = "텍스트 입력 모드이므로 음성 발음 평가는 생략되었습니다."
+            else:
+                feedback_json["pronunciation_feedback"] = "오디오 데이터 인식이 실패하여 정밀 발음 평가를 수립할 수 없습니다."
 
         return {"system_evaluation": feedback_json}
