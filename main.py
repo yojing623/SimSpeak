@@ -9,29 +9,19 @@ from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
 
-# 외부 API 오류 탐지용 예외 클래스들 임포트
-from openai import OpenAIError
-from azure.core.exceptions import AzureError
-
-# [DB 설정] SQLAlchemy 라이브러리 추가
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
-# 패키징된 최신 AI 파이프라인 클래스 로드
 from pipeline import SimSpeakAIPipeline
 
-# 환경변수 로드
 current_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(current_dir, ".env")
 load_dotenv(dotenv_path=env_path)
 
-app = FastAPI(title="SimSpeak True Parallel Async Core API")
+app = FastAPI(title="SimSpeak Lightning Async Core API")
 
-# =================================================================
-# ⚙️ [DB 세팅 및 테이블 정의]
-# =================================================================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./simspeak.db")
 Base = declarative_base()
 
@@ -89,9 +79,6 @@ def get_db():
     finally:
         db.close()
 
-# =========================================================
-# 📥 단일 요청 사양 규격
-# =========================================================
 class UnifiedChatRequest(BaseModel):
     user_id: str
     character_id: str
@@ -100,20 +87,19 @@ class UnifiedChatRequest(BaseModel):
     user_audio_url: Optional[str] = None  
     stage_id: Optional[str] = "stage_1"
 
-# 글로벌 AI 파이프라인 로드
 pipeline = SimSpeakAIPipeline()
 
 # =================================================================
-# 🧠 백그라운드 비동기 워커 (호감도 데이터 후행 결합 및 로그 출력)
+# 🧠 백그라운드 비동기 워커 (오답노트 및 정밀 발음 리포트 전용 로그)
 # =================================================================
 async def background_evaluation_worker(user_id: str, char_id: str, stage_id: str, user_audio_url: str, dialogue_result: dict):
     db = SessionLocal()
     try:
-        print(f"▶️ [비동기 병렬 피드백 트랙] 스타트 (유저 오디오 및 호감도 최종 정산 중...)")
+        print(f"▶️ [비동기 병렬 피드백 트랙] 스타트 (오답노트 및 정밀 발음 평가 중...)")
         
         user_recognized_text = dialogue_result.get("user_recognized_text", "")
         
-        # 1. 2차 피드백 엔진 구동 (발음 점수 래핑 완료)
+        # 1. 오답노트 & 발음 분석 실행
         feedback_payload = await pipeline.run_only_evaluation_track(
             user_id=user_id,
             character_id=char_id,
@@ -122,20 +108,19 @@ async def background_evaluation_worker(user_id: str, char_id: str, stage_id: str
             user_audio_url=user_audio_url
         )
         
-        # 🎯 [호감도 뒤쪽 배치 핵심] 1차 대화방 연산에서 숨겨왔던 호감도 지표를 2차 정산서 JSON에 강제 합병합니다.
+        # 로그 일치성을 위해 백그라운드 JSON 객체 내부에도 호감도 데이터 동기화 바인딩
         feedback_json = feedback_payload["system_evaluation"]
         feedback_json["affinity_delta"] = dialogue_result.get("affinity_delta", 0)
         feedback_json["current_total_affinity"] = dialogue_result.get("current_total_affinity", 30)
 
         print(f"✅ [비동기 병렬 피드백 트랙] 연산 마감 완료!")
         print(f"==================================================================")
-        print(f"📊 [TEST MONITORING] 최종 생성된 2차 피드백 JSON 결과 데이터 확인 (호감도 결합 완료)")
+        print(f"📊 [TEST MONITORING] 최종 생성된 2차 피드백 JSON 결과 데이터 확인")
         print(f"==================================================================")
-        # 이제 터미널 창에 오답노트 + 발음평가 + 호감도 리포트가 한 눈에 보기 좋게 출력됩니다.
         print(json.dumps(feedback_payload, ensure_ascii=False, indent=2))
         print(f"==================================================================")
 
-        # 2. Neon DB 영속화 마감 저장
+        # DB 영속화 마감 보관
         new_log = ChatLogModel(
             user_id=user_id,
             character_id=char_id,
@@ -178,7 +163,7 @@ async def background_evaluation_worker(user_id: str, char_id: str, stage_id: str
 
 
 # =================================================================
-# 🚀 통합 초고속 엔드포인트 (1차 화면 호감도 은닉 버전)
+# 🚀 통합 초고속 엔드포인트 (1차 화면 호감도 반환 버전 원복 완료)
 # =================================================================
 @app.post("/api/v1/chat/message")
 async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session = Depends(get_db)):
@@ -205,7 +190,7 @@ async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session =
     }
 
     try:
-        # 1. 초고속 대사 출력
+        # 1. 1차 대사방 연산 실행
         dialogue_result = await pipeline.run_only_dialogue_track(
             session_db=temp_session_db,
             user_id=user_id,
@@ -216,7 +201,7 @@ async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session =
             stage_id=request.stage_id
         )
 
-        # 2. 오답노트 및 호감도 후행 병렬 처리를 백그라운드로 전송
+        # 2. 백그라운드로 오답노트 및 정밀 발음 평가 독립 위임 처리
         asyncio.create_task(
             background_evaluation_worker(
                 user_id=user_id,
@@ -227,12 +212,14 @@ async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session =
             )
         )
 
-        # ⚡ [기획 반영] 유저 화면(Swagger 결과창)에는 딜레이와 정보 과부하를 막기 위해 호감도 필드를 완전 제외합니다.
+        # 🟢 [원복 완료] 유저가 응답을 즉시 받아볼 때, 호감도 결과 지표를 1차 필드에 포함하여 즉시 패킹 반환합니다!
         return {
-            "text_content": dialogue_result.get("text_content"),
-            "action_description": dialogue_result.get("action_description"),
-            "audio_url": dialogue_result.get("audio_url"),
-            "user_recognized_text": dialogue_result.get("user_recognized_text")
+          "text_content": dialogue_result.get("text_content"),
+          "action_description": dialogue_result.get("action_description"),
+          "audio_url": dialogue_result.get("audio_url"),
+          "user_recognized_text": dialogue_result.get("user_recognized_text"),
+          "affinity_delta": dialogue_result.get("affinity_delta"),           # 👈 다시 전면 배치 완료
+          "current_total_affinity": dialogue_result.get("current_total_affinity") # 👈 다시 전면 배치 완료
         }
 
     except Exception as e:
