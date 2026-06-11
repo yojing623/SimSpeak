@@ -24,7 +24,7 @@ class SimSpeakAIPipeline:
         self.speech_region = os.getenv("AZURE_SPEECH_REGION", "eastus")
         self.storage_connection = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 
-        # 🚀 [최적화 핵심] 커넥션 풀링 (Connection Pooling)
+        # 🚀 커넥션 풀링 (Connection Pooling)
         self.http_client = httpx.AsyncClient(timeout=15.0)
         
         self.llm_client = AsyncAzureOpenAI(
@@ -67,15 +67,16 @@ class SimSpeakAIPipeline:
                 self.llm_client,
                 model="gpt-4o-mini",
                 messages=safe_messages,
-                max_tokens=250
+                max_tokens=250,
+                # 💡 [핵심 수정] OpenAI가 무조건 완벽한 JSON 형식만 반환하도록 강제 (파싱 에러 원천 차단)
+                response_format={"type": "json_object"} 
             )
             return response.choices[0].message.content
         except Exception as e:
             print(f"🚨 [초고속 대사 엔진] 장애 우회 처리: {e}")
-            return '{"text_content": "앗, 미안해! 데이터가 살짝 밀렸나 봐. 다시 말해줄래?", "action_description": "멋쩍게 웃는다."}'
+            return '{"detected_invalid_words": [], "text_content": "앗, 미안해! 데이터가 살짝 밀렸나 봐. 다시 말해줄래?", "action_description": "멋쩍게 웃는다."}'
     
     def make_ssml(self, character_id: str, text_content: str) -> str:
-        import re
         char_id = character_id.lower()
         voice_name = "en-US-AndrewMultilingualNeural"
         rate, pitch = "0%", "0%"
@@ -194,6 +195,9 @@ class SimSpeakAIPipeline:
     async def get_character_prompt(self, character_id: str) -> str:
         async with aiofiles.open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: return await f.read()
 
+    # =========================================================================
+    # ⚡ 1차 대사 생성 & 콩글리시/한국어 페널티 트랙
+    # =========================================================================
     async def run_only_dialogue_track(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: str = "stage_1") -> dict:
         char_id = character_id.lower()
         if user_id not in session_db: session_db[user_id] = {}
@@ -208,10 +212,18 @@ class SimSpeakAIPipeline:
         base_prompt = await self.get_character_prompt(char_id)
         summary_prefix = f"[PAST CONVERSATION SUMMARY]\n{current_summary}\n\n" if current_summary else ""
         
+        # 💡 [핵심 수정] 배열을 최상단으로 옮겨 대사를 치기 전에 콩글리시부터 검사하도록 AI의 심리 역이용
         json_injection_rule = """
         [CRITICAL OUTPUT RULE]
-        You MUST respond ONLY with a raw, pure JSON object matching this schema. Do not include markdown blocks like ```json.
+        You MUST respond ONLY with a raw, pure JSON object matching this schema.
+
+        [🚨 URGENT INSTRUCTION]
+        1. FIRST, analyze the user's text. Extract ONLY Konglish words (e.g., "man-to-man", "notebook" for laptop, "cider" for soda) into "detected_invalid_words". 
+        Do NOT extract pure Korean words (e.g., "진짜", "대박") here. Only extract Konglish. If none, output [].
+        2. THEN, generate your character's response.
+
         {
+          "detected_invalid_words": [],
           "text_content": "Your verbal response in English (keep it under 2 short sentences)",
           "action_description": "Friendly behavioral status in Korean"
         }
@@ -227,25 +239,50 @@ class SimSpeakAIPipeline:
                 messages.append({"role": turn["role"], "content": turn["content"]})
         messages.append({"role": "user", "content": user_text})
 
-        print(f" 🧠 [ASYNC LLM CALL] User '{user_id}' - Requesting Dialogue 가속엔진 가동...")
+        print(f"[ASYNC LLM CALL] User '{user_id}' - Requesting Dialogue 가속엔진 가동...")
         raw_response = await self.generate_lightning_dialogue(messages)
-        clean_json_str = re.sub(r'```json\s*|```', '', raw_response).strip()
         
+        # 💡 JSON Mode가 적용되었으므로 정규식 없이 깔끔하고 안전하게 파싱합니다.
         try:
-            ai_result = json.loads(clean_json_str)
-        except Exception:
-            text_match = re.search(r'"text_content"\s*:\s*"([^"]+)"', clean_json_str)
-            action_match = re.search(r'"action_description"\s*:\s*"([^"]+)"', clean_json_str)
-            ai_result = {"text_content": text_match.group(1) if text_match else "Oh, sorry! I got distracted. What were you saying?", "action_description": action_match.group(1) if action_match else "여유롭게 웃어 보인다."}
+            ai_result = json.loads(raw_response)
+        except Exception as e:
+            print(f"🚨 [트랙 1 JSON 파싱 에러]: {e} / 원본 응답: {raw_response}")
+            ai_result = {
+                "detected_invalid_words": [],
+                "text_content": "Oh, sorry! I got distracted. What were you saying?",
+                "action_description": "여유롭게 웃어 보인다."
+            }
 
+        # 🚀 통합 감점 로직 계산
         ai_result["affinity_delta"] = 1
         ai_result["system_evaluation"] = {"is_penalty": False}
 
+        # 1. AI가 찾은 콩글리시 검사
+        detected_invalid = ai_result.get("detected_invalid_words", [])
+        konglish_count = len(detected_invalid) if isinstance(detected_invalid, list) else 0
+
+        # 2. 파이썬 순수 한글 혼용률 검사
+        mixed_ratio = 0
         words = user_text.split()
         if words:
             korean_word_count = sum(1 for w in words if any(0xAC00 <= ord(c) <= 0xD7A3 for c in w))
-            if (korean_word_count / len(words)) >= 0.30:
-                ai_result["affinity_delta"] = -1
+            
+            total_invalid_count = korean_word_count + konglish_count
+            mixed_ratio = total_invalid_count / len(words)
+            
+        stage_clean = str(stage_id).lower().strip().replace(" ", "_")
+        threshold = 0.30
+        if stage_clean in ["stage_3", "stage_4", "stage_5", "stage_6"]: threshold = 0.20
+        elif stage_clean in ["stage_7", "stage_8"]: threshold = 0.10
+
+        # 3. 합산된 혼용률이 스테이지 임계치(10~30%)를 넘었을 때만 감점
+        if mixed_ratio >= threshold:
+            ai_result["affinity_delta"] = -1
+            ai_result["system_evaluation"]["is_penalty"] = True
+
+        # 불필요한 배열 삭제 (DB 저장용 깔끔하게 정리)
+        if "detected_invalid_words" in ai_result:
+            del ai_result["detected_invalid_words"]
 
         user_data["history"].append({"role": "user", "content": user_text})
         user_data["history"].append({"role": "assistant", "content": json.dumps(ai_result, ensure_ascii=False)})
@@ -268,39 +305,53 @@ class SimSpeakAIPipeline:
     async def run_only_evaluation_track(self, user_id: str, character_id: str, user_text: str, stage_id: str = "stage_1", user_audio_url: str = None) -> dict:
         char_id = character_id.lower()
         
-        # 🟢 [수정됨] 텍스트가 아예 없으면 평가할 게 없으므로 종료하지만, 오디오가 없다고 튕겨내지 않습니다!
         if not user_text or user_text.strip() == "":
              return {"system_evaluation": {"is_penalty": False, "grammar_feedback": "입력된 텍스트가 없어 평가가 스킵되었습니다.", "corrections_json": [], "pronunciation_evaluations": None, "pronunciation_feedback": None}}
 
         system_feedback_prompt = """
-        너는 영어 교육 평가 시스템이야. 유저가 콩글리시나 어색한 한글 섞인 표현을 썼다면 세련된 100% 원어민 영문으로 고쳐줘.
-        또한, 유저 원문(original_sentence)에 포함된 주요 영단어들에 대한 정확한 원어민 IPA 발음 기호(예: [kæˈfeɪ])를 'ipa_guides' 딕셔너리에 포함해줘.
+        너는 영어 교육 평가 시스템이야.
+
+        [CRITICAL RULE]
+        유저가 'Konglish'를 썼다면(예: 'man-to-man', 'notebook'을 컴퓨터로, 'cider'를 탄산음료로 사용 등), 그 단어들을 반드시 "detected_invalid_words" 배열에 추출해라. 순수 한국어(예: '진짜')는 이 배열에 넣지 마라.
+        배열에 단어가 하나라도 있다면 "is_penalty"는 반드시 true 여야해.
+        그리고 유저가 콩글리시나 한국어 섞인 표현을 썼다면 세련된 100% 원어민 영문으로 고쳐줘.
+        또한, 유저 원문(original_sentence)에 포함된 주요 영단어들에 대한 정확한 원어민 IPA 발음 기호를 'ipa_guides' 딕셔너리에 포함해줘.
         
-        응답은 반드시 마크다운 블록 없이 순수 JSON만 반환해라:
-        {
+        [URGENT INSTRUCTION]
+        유저가 원래 영어와 다른 뜻으로 쓰는 콩글리시(False Friends)를 악착같이 찾아라!
+        예: "man-to-man" -> 맨투맨 티셔츠, "notebook" -> 노트북 컴퓨터, "cider" -> 탄산음료, "one piece" -> 원피스 치마, "padding" -> 패딩 점퍼 등)
+        순수 한국어는 절대 배열에 넣지 말고 오직 콩글리시만 배열에 넣어라.  
+        
+        [OUTPUT FORMAT] 
+        응답은 반드시 주석(//)이 없는 순수 JSON이어야 한다.
+        {   
+            "detected_invalid_words": [],
             "is_penalty": false,
             "grammar_feedback": "교정 이유를 설명하는 한국어 피드백",
             "corrections_json": [
                 {"original_sentence": "유저 원문", "corrected_sentence": "원어민 네이티브 영문"}
             ],
             "ipa_guides": {
-                "word1": "[ipa1]",
-                "word2": "[ipa2]"
+                "word1": "[ipa1]"
             }
         }
         """
         
-        # 1. 문법 및 IPA 교정 (무조건 실행)
         try:
             response = await self.call_llm_with_retry(
                 self.llm_client, 
                 model="gpt-4o-mini", 
                 messages=[{"role": "system", "content": system_feedback_prompt}, {"role": "user", "content": [{"type": "text", "text": str(user_text)}]}],
+                # 💡 2차 트랙에도 JSON Mode 추가하여 파싱 에러 방지
+                response_format={"type": "json_object"} 
             )
-            clean_feedback = re.sub(r'```json\s*|```', '', response.choices[0].message.content).strip()
-            feedback_json = json.loads(clean_feedback)
+            feedback_json = json.loads(response.choices[0].message.content)
         except Exception:
             feedback_json = {"is_penalty": False, "grammar_feedback": "시스템 분석 지연으로 실시간 문법 교정이 불가능합니다.", "corrections_json": [], "ipa_guides": {}}
+        
+        # LLM이 배열을 채웠는데 is_penalty를 깜빡했을 경우를 대비한 안전장치
+        if "detected_invalid_words" in feedback_json and len(feedback_json["detected_invalid_words"]) > 0:
+            feedback_json["is_penalty"] = True
 
         if "corrections" in feedback_json:
             feedback_json["corrections_json"] = feedback_json.pop("corrections")
@@ -319,12 +370,10 @@ class SimSpeakAIPipeline:
 
         gpt_ipa_map = {k.lower(): v for k, v in feedback_json.get("ipa_guides", {}).items()}
 
-        # 2. 발음 평가 (오디오가 전달되었을 때만 선택적 실행)
         real_pronunciation_evaluations = None
         if user_audio_url and user_audio_url.strip() != "":
             real_pronunciation_evaluations = await self.run_azure_pronunciation_assessment(user_id, user_audio_url, user_text)
 
-        # 3. 데이터 조립
         if real_pronunciation_evaluations and len(real_pronunciation_evaluations.get("word_details_json", [])) > 0:
             for word_obj in real_pronunciation_evaluations.get("word_details_json", []):
                 acc = word_obj.get("accuracy", 0)
@@ -341,7 +390,6 @@ class SimSpeakAIPipeline:
             feedback_json["pronunciation_feedback"] = "전반적인 문장 억양과 발음 분석이 성공적으로 마감되었습니다."
         else:
             feedback_json["pronunciation_evaluations"] = None
-            # 🟢 [수정됨] 텍스트 모드와 오디오 실패 모드의 피드백 메시지를 분리했습니다.
             if not user_audio_url or user_audio_url.strip() == "":
                 feedback_json["pronunciation_feedback"] = "텍스트 입력 모드이므로 음성 발음 평가는 생략되었습니다."
             else:
