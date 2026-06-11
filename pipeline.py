@@ -67,15 +67,15 @@ class SimSpeakAIPipeline:
                 self.llm_client,
                 model="gpt-4o-mini",
                 messages=safe_messages,
-                max_tokens=250
+                max_tokens=250,
+                response_format={"type": "json_object"}
             )
             return response.choices[0].message.content
         except Exception as e:
             print(f"🚨 [초고속 대사 엔진] 장애 우회 처리: {e}")
-            return '{"text_content": "앗, 미안해! 데이터가 살짝 밀렸나 봐. 다시 말해줄래?", "action_description": "멋쩍게 웃는다."}'
+            return '{"text_content": "앗, 미안해! 데이터가 살짝 밀렸나 봐. 다시 말해줄래?", "action_description": "멋쩍게 웃는다.", "affinity_delta": 0, "system_notification": "", "is_active": true}'
     
     def make_ssml(self, character_id: str, text_content: str) -> str:
-        import re
         char_id = character_id.lower()
         voice_name = "en-US-AndrewMultilingualNeural"
         rate, pitch = "0%", "0%"
@@ -88,7 +88,7 @@ class SimSpeakAIPipeline:
             
         pattern = re.compile(r'([\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]+(?:\s+[\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]+)*)')
         wrapped_text = pattern.sub(r'<lang xml:lang="ko-KR">\1</lang>', text_content)
-        return f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US"><voice name="{voice_name}"><prosody rate="{rate}" pitch="{pitch}">{wrapped_text}</prosody></voice></speak>'
+        return f'<speak version="1.0" xmlns="[http://www.w3.org/2001/10/synthesis](http://www.w3.org/2001/10/synthesis)" xml:lang="en-US"><voice name="{voice_name}"><prosody rate="{rate}" pitch="{pitch}">{wrapped_text}</prosody></voice></speak>'
 
     async def quick_whisper_transcription(self, user_id: str, audio_url: str) -> str:
         if not audio_url: return ""
@@ -194,6 +194,9 @@ class SimSpeakAIPipeline:
     async def get_character_prompt(self, character_id: str) -> str:
         async with aiofiles.open(f"prompts/{character_id.lower()}.txt", "r", encoding="utf-8") as f: return await f.read()
 
+    # =========================================================================
+    # ⚡ 1차 초고속 대사 처리 (텍스트/음성 모드 완벽 분기 적용)
+    # =========================================================================
     async def run_only_dialogue_track(self, session_db: dict, user_id: str, character_id: str, user_text: str, is_video_call: bool, user_audio_url: str = None, stage_id: str = "stage_1") -> dict:
         char_id = character_id.lower()
         if user_id not in session_db: session_db[user_id] = {}
@@ -208,15 +211,26 @@ class SimSpeakAIPipeline:
         base_prompt = await self.get_character_prompt(char_id)
         summary_prefix = f"[PAST CONVERSATION SUMMARY]\n{current_summary}\n\n" if current_summary else ""
         
+        mode_instruction = (
+            "VOICE CALL MODE: You are facing the user. Physical interaction and close-up expressions are allowed." 
+            if is_video_call else 
+            "TEXT MESSAGE MODE: You are chatting via text. NO physical contact. Describe independent 3rd-person actions (e.g., looking at phone, drinking coffee, sighing alone)."
+        )
+
         json_injection_rule = """
-        [CRITICAL OUTPUT RULE]
-        You MUST respond ONLY with a raw, pure JSON object matching this schema. Do not include markdown blocks like ```json.
+        [CRITICAL OVERRIDE: FAST TRACK JSON FORMAT]
+        IGNORE the [STRICT OUTPUT FORMAT] in your base persona. DO NOT generate 'system_evaluation' or 'corrections'.
+        You MUST respond ONLY with a valid JSON object matching exactly this schema:
         {
-          "text_content": "Your verbal response in English (keep it under 2 short sentences)",
-          "action_description": "Friendly behavioral status in Korean"
+          "text_content": "Your verbal response in English",
+          "action_description": "Behavioral status in Korean",
+          "affinity_delta": integer (-5 to 5, based strictly on your persona rules),
+          "system_notification": "Warning message if applicable, else empty string",
+          "is_active": boolean (false only if user used severe profanity)
         }
         """
-        system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Input Mode: is_video_call={is_video_call}\n\n{json_injection_rule}"
+        
+        system_prompt = summary_prefix + base_prompt + f"\n\n[LIVE STATUS]\n- Current Affinity: {user_data['current_affinity']}/100\n- Current Mode: {mode_instruction}\n\n{json_injection_rule}"
         messages = [{"role": "system", "content": system_prompt}]
         
         for turn in user_data["history"][-6:]:
@@ -229,29 +243,36 @@ class SimSpeakAIPipeline:
 
         print(f" 🧠 [ASYNC LLM CALL] User '{user_id}' - Requesting Dialogue 가속엔진 가동...")
         raw_response = await self.generate_lightning_dialogue(messages)
-        clean_json_str = re.sub(r'```json\s*|```', '', raw_response).strip()
+        
+        # 🟢 [수정됨] 정규식(Regex) 대신 100% 안전한 기본 replace 함수를 사용하여 복사 에러 원천 차단!
+        clean_json_str = raw_response.replace("```json", "").replace("```", "").strip()
         
         try:
             ai_result = json.loads(clean_json_str)
         except Exception:
             text_match = re.search(r'"text_content"\s*:\s*"([^"]+)"', clean_json_str)
             action_match = re.search(r'"action_description"\s*:\s*"([^"]+)"', clean_json_str)
-            ai_result = {"text_content": text_match.group(1) if text_match else "Oh, sorry! I got distracted. What were you saying?", "action_description": action_match.group(1) if action_match else "여유롭게 웃어 보인다."}
+            ai_result = {
+                "text_content": text_match.group(1) if text_match else "Oh, sorry! I got distracted. What were you saying?", 
+                "action_description": action_match.group(1) if action_match else "여유롭게 웃어 보인다.",
+                "affinity_delta": 0, "is_active": True, "system_notification": ""
+            }
 
-        ai_result["affinity_delta"] = 1
-        ai_result["system_evaluation"] = {"is_penalty": False}
+        affinity_delta = ai_result.get("affinity_delta", 0)
 
         words = user_text.split()
         if words:
             korean_word_count = sum(1 for w in words if any(0xAC00 <= ord(c) <= 0xD7A3 for c in w))
             if (korean_word_count / len(words)) >= 0.30:
-                ai_result["affinity_delta"] = -1
+                affinity_delta = -1
 
         user_data["history"].append({"role": "user", "content": user_text})
         user_data["history"].append({"role": "assistant", "content": json.dumps(ai_result, ensure_ascii=False)})
-        user_data["current_affinity"] = max(0, min(100, user_data["current_affinity"] + ai_result["affinity_delta"]))
+        user_data["current_affinity"] = max(0, min(100, user_data["current_affinity"] + affinity_delta))
 
-        main_audio_url = await self.generate_tts(user_id, char_id, ai_result.get("text_content", ""))
+        main_audio_url = ""
+        if ai_result.get("is_active", True) and ai_result.get("text_content", ""):
+            main_audio_url = await self.generate_tts(user_id, char_id, ai_result.get("text_content", ""))
 
         ai_result["audio_url"] = main_audio_url
         ai_result["user_recognized_text"] = user_text
@@ -263,12 +284,11 @@ class SimSpeakAIPipeline:
         return ai_result
 
     # =========================================================================
-    # ⚡ 2차 오답노트 백그라운드 (차단벽 제거 및 텍스트 검사 무조건 실행 완벽 적용)
+    # ⚡ 2차 오답노트 백그라운드 
     # =========================================================================
     async def run_only_evaluation_track(self, user_id: str, character_id: str, user_text: str, stage_id: str = "stage_1", user_audio_url: str = None) -> dict:
         char_id = character_id.lower()
         
-        # 🟢 [수정됨] 텍스트가 아예 없으면 평가할 게 없으므로 종료하지만, 오디오가 없다고 튕겨내지 않습니다!
         if not user_text or user_text.strip() == "":
              return {"system_evaluation": {"is_penalty": False, "grammar_feedback": "입력된 텍스트가 없어 평가가 스킵되었습니다.", "corrections_json": [], "pronunciation_evaluations": None, "pronunciation_feedback": None}}
 
@@ -290,14 +310,16 @@ class SimSpeakAIPipeline:
         }
         """
         
-        # 1. 문법 및 IPA 교정 (무조건 실행)
         try:
             response = await self.call_llm_with_retry(
                 self.llm_client, 
                 model="gpt-4o-mini", 
                 messages=[{"role": "system", "content": system_feedback_prompt}, {"role": "user", "content": [{"type": "text", "text": str(user_text)}]}],
+                response_format={"type": "json_object"} 
             )
-            clean_feedback = re.sub(r'```json\s*|```', '', response.choices[0].message.content).strip()
+            # 🟢 [수정됨] 정규식(Regex) 대신 100% 안전한 기본 replace 함수를 사용하여 복사 에러 원천 차단!
+            raw_feedback_content = response.choices[0].message.content
+            clean_feedback = raw_feedback_content.replace("```json", "").replace("```", "").strip()
             feedback_json = json.loads(clean_feedback)
         except Exception:
             feedback_json = {"is_penalty": False, "grammar_feedback": "시스템 분석 지연으로 실시간 문법 교정이 불가능합니다.", "corrections_json": [], "ipa_guides": {}}
@@ -319,12 +341,10 @@ class SimSpeakAIPipeline:
 
         gpt_ipa_map = {k.lower(): v for k, v in feedback_json.get("ipa_guides", {}).items()}
 
-        # 2. 발음 평가 (오디오가 전달되었을 때만 선택적 실행)
         real_pronunciation_evaluations = None
         if user_audio_url and user_audio_url.strip() != "":
             real_pronunciation_evaluations = await self.run_azure_pronunciation_assessment(user_id, user_audio_url, user_text)
 
-        # 3. 데이터 조립
         if real_pronunciation_evaluations and len(real_pronunciation_evaluations.get("word_details_json", [])) > 0:
             for word_obj in real_pronunciation_evaluations.get("word_details_json", []):
                 acc = word_obj.get("accuracy", 0)
@@ -341,7 +361,6 @@ class SimSpeakAIPipeline:
             feedback_json["pronunciation_feedback"] = "전반적인 문장 억양과 발음 분석이 성공적으로 마감되었습니다."
         else:
             feedback_json["pronunciation_evaluations"] = None
-            # 🟢 [수정됨] 텍스트 모드와 오디오 실패 모드의 피드백 메시지를 분리했습니다.
             if not user_audio_url or user_audio_url.strip() == "":
                 feedback_json["pronunciation_feedback"] = "텍스트 입력 모드이므로 음성 발음 평가는 생략되었습니다."
             else:
