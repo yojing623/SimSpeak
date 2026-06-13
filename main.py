@@ -1,218 +1,262 @@
 import os
 import json
-from fastapi import FastAPI, HTTPException, Depends
+import logging
+import asyncio
+import datetime
+from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
 
-# [DB 설정] SQLAlchemy 라이브러리 추가
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
-import datetime
 
-# 패키징된 AI 파이프라인 클래스 로드
 from pipeline import SimSpeakAIPipeline
 
-# 환경변수 로드 (절대 경로 적용으로 터미널 꼬임 방지)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(current_dir, ".env")
 load_dotenv(dotenv_path=env_path)
 
-app = FastAPI(title="SimSpeak Production Pronunciation Core API")
+app = FastAPI(title="SimSpeak Lightning Async Core API")
 
-
-# =========================================================
-# [DB 설정] 환경변수(DATABASE_URL) 로드 및 자동 분기형 DB 엔진 세팅
-# =========================================================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./simspeak.db")
-
-print(f"[DB Connect Attempt] Database URL: {DATABASE_URL}")
-
 Base = declarative_base()
 
 try:
-    # SQLite와 PostgreSQL 환경에 맞춰 최적의 옵션으로 분기 생성
     if DATABASE_URL.startswith("sqlite"):
-        engine = create_engine(
-            DATABASE_URL, 
-            connect_args={"check_same_thread": False}
-        )
+        engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
     else:
-        engine = create_engine(
-            DATABASE_URL, 
-            pool_pre_ping=True
-        )
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 except Exception as db_err:
-    print(f"[DB Error] Failed to create database engine: {db_err}")
+    print(f"[DB Error] {db_err}")
 
-# DB에 생성될 chat_logs 테이블 구조 정의
 class ChatLogModel(Base):
     __tablename__ = "chat_logs"
-
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String(50), index=True, nullable=False)
     character_id = Column(String(50), index=True, nullable=False)
     user_text = Column(Text, nullable=False)
-    user_audio_url = Column(Text, nullable=True)         # 유저가 업로드한 오디오 URL 기록
+    user_audio_url = Column(Text, nullable=True)         
     ai_text_content = Column(Text, nullable=False)
-    ai_audio_url = Column(Text, nullable=True)           # AI 답변 음성 주소 기록용
-    current_affinity = Column(Integer, default=30)       # 영구 저장되는 호감도 스탯
-    summary_context = Column(Text, nullable=True)        # [토큰 절약] 오래된 과거 기억 압축 저장소
-    stage_id = Column(String(50), nullable=True)            # 진행 중인 스테이지 정보 기록
+    ai_audio_url = Column(Text, nullable=True)           
+    current_affinity = Column(Integer, default=30)       
+    summary_context = Column(Text, nullable=True)        
+    stage_id = Column(String(50), nullable=True)            
     
-    # 데이터베이스 종류에 맞춰 유연하게 컬럼 타입 세팅 (PostgreSQL일 때는 전용 고성능 JSONB 강제)
     if DATABASE_URL.startswith("sqlite"):
         from sqlalchemy import JSON
-        chat_history_context = Column(JSON, nullable=False)   # 대화 히스토리 배열 통째로 저장 (JSON)
-        raw_llm_log = Column(JSON, nullable=False)            # 대표님 보고용 토큰 및 원본 생로그 (JSON)
+        chat_history_context = Column(JSON, nullable=False)   
+        raw_llm_log = Column(JSON, nullable=False)            
     else:
-        chat_history_context = Column(JSONB, nullable=False)   # 대화 히스토리 배열 통째로 저장 (JSONB)
-        raw_llm_log = Column(JSONB, nullable=False)            # 대표님 보고용 토큰 및 원본 생로그 (JSONB)
+        chat_history_context = Column(JSONB, nullable=False)   
+        raw_llm_log = Column(JSONB, nullable=False)            
 
-# [팀원 DB 구조 통합] character_chat_logs 테이블 구조 정의
 class CharacterChatLogModel(Base):
     __tablename__ = "character_chat_logs"
-
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String(100), nullable=False)
     character_id = Column(String(50), nullable=False)
-    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
-
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.timezone.utc))
     if DATABASE_URL.startswith("sqlite"):
         from sqlalchemy import JSON
         response_data = Column(JSON, nullable=False)
     else:
         response_data = Column(JSONB, nullable=False)
 
-# 백엔드가 켜질 때 테이블이 없으면 자동으로 DB에 만들어 주는 안전장치
+class EnglishLevelTestModel(Base):
+    __tablename__ = "english_level_tests"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(50), index=True, nullable=False)
+    test_type = Column(String(50), nullable=False, default="PLACEMENT")
+    assigned_level = Column(String(10), nullable=False)
+    test_score = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.timezone.utc))
+
 try:
     Base.metadata.create_all(bind=engine)
-    print(f"[DB Success] Verified / created table successfully on {DATABASE_URL.split('://')[0]} database!")
-    
-    # [DB 자동 마이그레이션] 기존 Neon DB/SQLite 테이블에 stage_id 컬럼이 없을 경우 자동으로 추가
-    from sqlalchemy import text
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE chat_logs ADD COLUMN stage_id VARCHAR(50);"))
-        print("[DB Success] Automatically added 'stage_id' column to chat_logs table.")
-    except Exception as alter_err:
-        # 이미 컬럼이 존재하는 등의 이유로 에러가 나면 무시하고 정상 진행합니다.
-        print(f"[DB Info] Auto ALTER COLUMN 'stage_id' status: {alter_err}")
-except Exception as table_err:
-    print(f"[DB Error] Table creation/verification failed: {table_err}")
+except Exception:
+    pass
 
-# API 요청이 올 때마다 안전하게 데이터베이스 세션을 열고 닫아주는 함수
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-# =========================================================
 
-
-# 2. API 요청 데이터 스키마 (팀원 코드 유지)
-class ChatRequest(BaseModel):
+class UnifiedChatRequest(BaseModel):
     user_id: str
-    character_id: str  
-    text: str
+    character_id: str
+    text: str  
     is_video_call: bool
-    user_audio_url: Optional[str] = None  # 다른 팀원이 Blob에 저장 후 넘겨줄 오디오 URL 주소
+    user_audio_url: Optional[str] = None  
     stage_id: Optional[str] = "stage_1"
 
-# AI 파이프라인 인스턴스 전역 생성
+class UnifiedLevelTestRequest(BaseModel):
+    user_id: str
+    character_id: str
+    current_question_index: int  # 1 ~ 8
+    user_audio_url: Optional[str] = None
+    user_text: Optional[str] = None
+    accumulated_answers: Optional[list] = []
+
 pipeline = SimSpeakAIPipeline()
 
+async def background_evaluation_worker(user_id: str, char_id: str, stage_id: str, user_audio_url: str, dialogue_result: dict):
+    db = SessionLocal()
+    try:
+        print(f"▶️ [비동기 병렬 피드백 트랙] 스타트 (오답노트 및 정밀 발음 평가 중...)")
+        
+        user_recognized_text = dialogue_result.get("user_recognized_text", "")
+        feedback_payload = await pipeline.run_only_evaluation_track(
+            user_id=user_id,
+            character_id=char_id,
+            user_text=user_recognized_text,
+            stage_id=stage_id,
+            user_audio_url=user_audio_url
+        )
+        
+        feedback_json = feedback_payload["system_evaluation"]
+        feedback_json["affinity_delta"] = dialogue_result.get("affinity_delta", 0)
+        feedback_json["current_total_affinity"] = dialogue_result.get("current_total_affinity", 30)
 
-# 4. 깔끔하게 정리된 완성형 엔드포인트
-@app.post("/chat")
-async def chat_with_character(request: ChatRequest, db: Session = Depends(get_db)):
+        print(f"✅ [비동기 병렬 피드백 트랙] 연산 마감 완료!")
+        print(f"==================================================================")
+        print(json.dumps(feedback_payload, ensure_ascii=False, indent=2))
+        print(f"==================================================================")
+
+        new_log = ChatLogModel(
+            user_id=user_id, character_id=char_id, user_text=user_recognized_text,
+            user_audio_url=user_audio_url, ai_text_content=dialogue_result.get("text_content", ""),
+            ai_audio_url=dialogue_result.get("audio_url", ""), current_affinity=dialogue_result.get("current_total_affinity", 30), 
+            chat_history_context=dialogue_result.get("history_context", []), raw_llm_log=dialogue_result.get("raw_llm_log", {}),
+            summary_context=dialogue_result.get("summary_context", ""), stage_id=stage_id
+        )
+        final_monitoring_data = {
+            "text_content": dialogue_result.get("text_content", ""), "action_description": dialogue_result.get("action_description", ""),
+            "audio_url": dialogue_result.get("audio_url", ""), "user_recognized_text": user_recognized_text,
+            "affinity_delta": dialogue_result.get("affinity_delta", 0), "current_total_affinity": dialogue_result.get("current_total_affinity", 30),
+            "system_evaluation": feedback_json
+        }
+        new_monitoring_log = CharacterChatLogModel(user_id=user_id, character_id=char_id, response_data=final_monitoring_data)
+        
+        # 🚀 [DB 블로킹 제거] DB 저장도 백그라운드 스레드로 위임하여 서버 마비 방지
+        def save_to_db():
+            db.add(new_log)
+            db.add(new_monitoring_log)
+            db.commit()
+            
+        await asyncio.to_thread(save_to_db)
+        print(f"🎉 [Neon DB] 대사방 로그 + 오답노트 정산본 한 통으로 합치기 최종 성공!")
+
+    except Exception as bg_err:
+        db.rollback()
+        print(f"❌ [백그라운드 피드백 에러 발생]: {bg_err}")
+    finally:
+        db.close()
+
+
+@app.post("/api/v1/chat/message")
+async def process_chat_simultaneously(request: UnifiedChatRequest, db: Session = Depends(get_db)):
     char_id = request.character_id.lower()
     user_id = request.user_id
-    print(f"[User: {user_id}] -> [{char_id}] Initial Input Text: {request.text}")
 
-    # [DB 연동] 로컬 DB에서 해당 유저의 최신 대화 로그 1건 가져와 복구
-    last_log = db.query(ChatLogModel)\
-        .filter(ChatLogModel.user_id == user_id, ChatLogModel.character_id == char_id)\
-        .order_by(ChatLogModel.id.desc())\
-        .first()
+    # 🚀 [DB 블로킹 제거] 동기식 DB 쿼리가 FastAPI 메인 루프를 멈추지 못하게 스레드로 분리!
+    def fetch_last_log():
+        return db.query(ChatLogModel).filter(
+            ChatLogModel.user_id == user_id, 
+            ChatLogModel.character_id == char_id
+        ).order_by(ChatLogModel.id.desc()).first()
 
-    if last_log:
-        history = list(last_log.chat_history_context)
-        current_affinity = last_log.current_affinity
-        current_summary = last_log.summary_context or ""
-        print(f"[Memory Load] Restored past memory from DB. (Affinity: {current_affinity}/100, Summary exists: {bool(current_summary)})")
-    else:
-        history = []
-        current_affinity = 30  # 최초 대화 시 기본 친밀도
-        current_summary = ""
-        print("[New Chat] First conversation entry created.")
+    last_log = await asyncio.to_thread(fetch_last_log)
 
-    # pipeline.run() 인터페이스에 맞게 임시 세션 딕셔너리 구조 생성 (어댑터 패턴)
-    temp_session_db = {
-        user_id: {
-            char_id: {
-                "history": history,
-                "current_affinity": current_affinity,
-                "summary_context": current_summary
-            }
-        }
-    }
+    history = list(last_log.chat_history_context) if last_log else []
+    current_affinity = last_log.current_affinity if last_log else 30
+    current_summary = last_log.summary_context or "" if last_log else ""
+
+    temp_session_db = {user_id: {char_id: {"history": history, "current_affinity": current_affinity, "summary_context": current_summary}}}
 
     try:
-        # 단일 파이프라인 가동 (STT -> LLM -> TTS -> Blob 업로드 일괄 수행)
-        ai_result = await pipeline.run(
-            session_db=temp_session_db,
-            user_id=user_id,
-            character_id=char_id,
-            user_text=request.text,
-            is_video_call=request.is_video_call,
-            user_audio_url=request.user_audio_url,
-            stage_id=request.stage_id
+        dialogue_result = await pipeline.run_only_dialogue_track(
+            session_db=temp_session_db, user_id=user_id, character_id=char_id,
+            user_text=request.text, is_video_call=request.is_video_call,
+            user_audio_url=request.user_audio_url, stage_id=request.stage_id
         )
 
-        # 파이프라인 실행 후 업데이트된 세션 정보 및 친밀도 회수
-        updated_data = temp_session_db[user_id][char_id]
-        updated_history = updated_data["history"]
-        updated_affinity = updated_data["current_affinity"]
-        updated_summary = updated_data.get("summary_context", "")
-
-        # 파이프라인에서 조립된 대표님 보고용 GPT 생로그 추출
-        raw_usage_log = ai_result.pop("raw_llm_log", {})
-
-        # 대화 기록 및 AI 모니터링 생로그 DB 영구 저장
-        new_log = ChatLogModel(
-            user_id=user_id,
-            character_id=char_id,
-            user_text=ai_result.get("user_recognized_text", request.text),   # Whisper가 감지한 텍스트 반영
-            user_audio_url=request.user_audio_url,
-            ai_text_content=ai_result.get("text_content", ""),
-            ai_audio_url=ai_result.get("audio_url", ""),                    # 실제 합성되어 업로드된 TTS 오디오 주소
-            current_affinity=updated_affinity,       
-            chat_history_context=updated_history,                            # JSON/JSONB 타입으로 대화 배열 통째로 적재
-            raw_llm_log=raw_usage_log,                                       # JSON/JSONB 타입으로 토큰 사용량 생로그 저장
-            summary_context=updated_summary,                                 # 압축 누적된 장기 기억 요약본 저장
-            stage_id=request.stage_id
+        asyncio.create_task(
+            background_evaluation_worker(
+                user_id=user_id, char_id=char_id, stage_id=request.stage_id,
+                user_audio_url=request.user_audio_url, dialogue_result=dialogue_result
+            )
         )
-        db.add(new_log)
 
-        # [팀원 DB 구조 통합] character_chat_logs 테이블에도 동일하게 response JSON 저장
-        new_monitoring_log = CharacterChatLogModel(
-            user_id=user_id,
-            character_id=char_id,
-            response_data=ai_result
-        )
-        db.add(new_monitoring_log)
-
-        db.commit() # 데이터베이스 저장 확정!
-        print("[DB Success] Dialog and raw monitoring logs saved successfully (both chat_logs and character_chat_logs).")
-        
-        return ai_result
+        return {
+          "text_content": dialogue_result.get("text_content"),
+          "action_description": dialogue_result.get("action_description"),
+          "audio_url": dialogue_result.get("audio_url"),
+          "user_recognized_text": dialogue_result.get("user_recognized_text"),
+          "affinity_delta": dialogue_result.get("affinity_delta"),
+          "current_total_affinity": dialogue_result.get("current_total_affinity")
+        }
 
     except Exception as e:
-        db.rollback() # 에러 발생 시 데이터 정합성을 위해 트랜잭션 롤백
-        print(f"[Error] Pipeline processing error: {e}")
+        print(f"❌ [메인 트랙 치명적 에러]: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def background_level_test_evaluator(user_id: str, accumulated_answers: list):
+    db = SessionLocal()
+    try:
+        print(f"▶️ [레벨 테스트 종합 평가] 스타트 (8문항 분석 중...)")
+        final_result = await pipeline.evaluate_holistic_cefr_level(accumulated_answers)
+        
+        # DB 저장
+        new_test = EnglishLevelTestModel(
+            user_id=user_id,
+            test_type="PLACEMENT",
+            assigned_level=final_result.get("assigned_level", "A1"),
+            test_score=final_result.get("test_score", 0)
+        )
+        db.add(new_test)
+        db.commit()
+        print(f"✅ [레벨 테스트 종합 평가] 완료 및 DB 저장 성공: {final_result.get('assigned_level')}")
+    except Exception as e:
+        db.rollback()
+        print(f"❌ [Level Test Background Error]: {e}")
+    finally:
+        db.close()
+
+@app.post("/api/v1/chat/level_test")
+async def process_level_test_question(request: UnifiedLevelTestRequest, db: Session = Depends(get_db)):
+    try:
+        result = await pipeline.process_level_test_question(
+            user_id=request.user_id,
+            character_id=request.character_id,
+            question_index=request.current_question_index,
+            user_audio_url=request.user_audio_url,
+            user_text=request.user_text or ""
+        )
+        
+        # 8번 문항(마지막)이면 평가 워커 띄우기
+        if request.current_question_index == 8:
+            accuracy = None
+            fluency = None
+            if result.get("pronunciation_evaluations"):
+                accuracy = result["pronunciation_evaluations"].get("accuracy")
+                fluency = result["pronunciation_evaluations"].get("fluency")
+                
+            # 마지막 문항 답변을 accumulated_answers에 추가
+            if request.accumulated_answers is not None:
+                request.accumulated_answers.append({
+                    "question_index": 8,
+                    "text": result.get("user_recognized_text", ""),
+                    "accuracy": accuracy,
+                    "fluency": fluency
+                })
+                asyncio.create_task(background_level_test_evaluator(request.user_id, request.accumulated_answers))
+            
+        return result
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
