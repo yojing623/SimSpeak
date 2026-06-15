@@ -169,25 +169,37 @@ class SimSpeakAIPipeline:
     async def generate_tts(self, user_id: str, character_id: str, text_content: str) -> str:
         if not text_content or text_content.strip() == "":
             return ""
+        
         temp_filename = f"reply_{uuid.uuid4().hex[:8]}.mp3"
+        
         try:
-            def run_tts_synthesis():
-                speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
-                audio_config = speechsdk.audio.AudioOutputConfig(filename=temp_filename)
-                synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
-                synthesizer.speak_ssml_async(self.make_ssml(character_id, text_content)).get()
-            await asyncio.to_thread(run_tts_synthesis)
+            # ========================================================
+            # 1. 애저 대신 작성자님이 만든 일레븐랩스 매니저 호출!
+            # ========================================================
+            from elevenlabs_manager import generate_elevenlabs_audio
+            success = await generate_elevenlabs_audio(character_id, text_content, temp_filename)
+            
+            # 생성에 실패했으면 빈 문자열 반환
+            if not success:
+                return ""
 
+            # ========================================================
+            # 2. 팀원이 짜둔 애저 클라우드(Blob) 업로드 코드는 100% 그대로 유지
+            # ========================================================
             def upload_to_blob():
                 blob_client = self.blob_container.get_blob_client(temp_filename)
                 with open(temp_filename, "rb") as data: 
                     blob_client.upload_blob(data, overwrite=True)
                 return blob_client.url
+            
             blob_url = await asyncio.to_thread(upload_to_blob)
             return blob_url
-        except Exception:
+            
+        except Exception as e:
+            print(f"🎙️ 음성 생성 및 업로드 에러: {e}")
             return ""
         finally:
+            # 3. 로컬 찌꺼기 파일 삭제
             if os.path.exists(temp_filename):
                 try: os.remove(temp_filename)
                 except: pass
@@ -447,7 +459,7 @@ class SimSpeakAIPipeline:
     # =========================================================================
     # ⚡ 3차 레벨 테스트 전용 트랙 (피드백 없이 등급/점수만 깔끔하게 반환)
     # =========================================================================
-    async def process_level_test_question(self, user_id: str, character_id: str, question_index: int, user_audio_url: str = None, user_text: str = "") -> dict:
+    async def process_level_test_question(self, user_id: str, character_id: str, question_index: int, user_audio_url: str = None, user_text: str = "", is_finishing: bool = False) -> dict:
         char_id = character_id.lower()
         
         if user_audio_url:
@@ -472,8 +484,9 @@ class SimSpeakAIPipeline:
         
         next_question_audio_url = None
         next_question_text = None
-        # 1~7번 문항이면, 다음 번호의 질문을 읽어주는 TTS 생성
-        if 1 <= question_index < 8:
+        
+        # 1~7번 문항이고 현재 종료하는 중이 아니라면, 다음 번호의 질문을 읽어주는 TTS 생성
+        if (1 <= question_index < 8) and not is_finishing:
             next_question_text = questions[question_index] 
             next_question_audio_url = await self.generate_tts(user_id, char_id, next_question_text)
             
@@ -503,7 +516,8 @@ class SimSpeakAIPipeline:
 
         system_prompt = f"""
         You are an expert CEFR English evaluator.
-        You will be provided with a user's answers to 8 level test questions.
+        You will be provided with a user's answers to the level test questions.
+        Note: The user may have quit early, so there may be fewer than 8 questions. Evaluate based ONLY on the provided transcripts.
         
         [Evaluation Criteria]
         - A1/A2: Single words or simple sentences. Struggles with basic past tense.
@@ -511,19 +525,32 @@ class SimSpeakAIPipeline:
         - B2: Clear reasoning, uses 'because/so/if' properly. Uses conditionals.
         - C1/C2: Abstract arguments, complex grammar (although, whereas), diverse vocabulary.
         
+        [Detailed Metrics (Score out of 100)]
+        1. expression_score (표현력): Naturalness of English expressions and phrasing.
+        2. grammar_score (문법 정확도): Accuracy of tenses, subject-verb agreement, prepositions, etc.
+        3. task_completion_score (과제 수행도): How well they answered the specific question asked. (If fewer questions answered, grade based on the ones answered).
+        4. vocabulary_score (어휘력): Richness and advanced level of vocabulary used.
+        
         [User Transcripts]
         {transcript_str}
         
-        [Average Pronunciation Score (0-100)]
+        [Average Fluency Score from Speech Engine (0-100)]
         {avg_pronunciation:.1f}
         
-        Based on the transcripts and pronunciation score, evaluate the overall English level.
-        DO NOT provide any detailed feedback explanations. ONLY return a JSON object with the assigned level and final score.
+        Based on the transcripts and the provided fluency score, evaluate the overall English level and detailed metrics.
+        The 'fluency_score' MUST be exactly {int(avg_pronunciation)}.
+        The 'test_score' should be the overall average of the 5 detailed metrics.
+        DO NOT provide any detailed feedback explanations. ONLY return a JSON object.
         
         [OUTPUT FORMAT]
         {{
             "assigned_level": "A1" | "A2" | "B1" | "B2" | "C1" | "C2",
-            "test_score": integer (0 to 100)
+            "test_score": integer (0 to 100),
+            "fluency_score": {int(avg_pronunciation)},
+            "expression_score": integer (0 to 100),
+            "grammar_score": integer (0 to 100),
+            "task_completion_score": integer (0 to 100),
+            "vocabulary_score": integer (0 to 100)
         }}
         """
 
@@ -539,4 +566,7 @@ class SimSpeakAIPipeline:
             return json.loads(clean_str)
         except Exception as e:
             print(f"❌ [Level Test Eval Error]: {e}")
-            return {"assigned_level": "A1", "test_score": 0}
+            return {
+                "assigned_level": "A1", "test_score": 0, "fluency_score": 0, 
+                "expression_score": 0, "grammar_score": 0, "task_completion_score": 0, "vocabulary_score": 0
+            }
